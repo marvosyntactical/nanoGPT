@@ -19,13 +19,17 @@ from torch import nn
 from torch.nn import functional as F
 from torch.autograd import Variable
 
-# stolen from https://github.com/msurtsukov/neural-ode/blob/master/Neural%20ODEs.ipynb
+from sinkhorn import SinkhornDistance
+import satnet
 
-def ode_solve(z0, t0, t1, f):
+MAX_ITER_SINK = 6
+
+# the following are taken from https://github.com/msurtsukov/neural-ode/blob/master/Neural%20ODEs.ipynb
+
+def ode_solve_euler(z0, t0, t1, f, h_max=0.05):
     """
     Simplest Euler ODE initial value solver
     """
-    h_max = 0.05
     n_steps = math.ceil((abs(t1 - t0)/h_max).max().item())
 
     h = (t1 - t0)/n_steps
@@ -36,6 +40,57 @@ def ode_solve(z0, t0, t1, f):
         z = z + h * f(z, t)
         t = t + h
     return z
+
+
+def rk4_step(z0, t0, h, f):
+    """
+    Performs a single step of the RK4 method
+
+    Parameters:
+    - z0: Initial state
+    - t0: Initial time
+    - h: Step size
+    - f: Derivative function of the ODE, f(z, t)
+
+    Returns:
+    - z_next: State of the system after step h
+    """
+    k1 = f(z0, t0)
+    k2 = f(z0 + h * k1 / 2, t0 + h / 2)
+    k3 = f(z0 + h * k2 / 2, t0 + h / 2)
+    k4 = f(z0 + h * k3, t0 + h)
+
+    z_next = z0 + h * (k1 + 2*k2 + 2*k3 + k4) / 6
+    return z_next
+
+def ode_solve_rk4(z0, t0, t1, f, h_max=0.05):
+    """
+    Solves an ODE using the RK4 method
+
+    Parameters:
+    - z0: Initial state vector
+    - t0: Initial time
+    - t1: Final time
+    - f: Derivative function of the ODE, f(z, t)
+
+    Returns:
+    - z: State of the system at time t1
+    """
+    # h_max = 0.05  # You can adjust this for a trade-off between accuracy and computational expense
+    n_steps = math.ceil((abs(t1 - t0) / h_max).max().item())
+
+    h = (t1 - t0) / n_steps
+    t = t0
+    z = z0
+
+    for i_step in range(n_steps):
+        z = rk4_step(z, t, h, f)
+        t = t + h
+    return z
+
+# ode_solve = ode_solve_rk4
+ode_solve = ode_solve_euler
+
 
 class ODEF(nn.Module):
     def forward_with_grad(self, z, t, grad_outputs):
@@ -69,100 +124,173 @@ class ODEF(nn.Module):
 class ODEAdjoint(torch.autograd.Function):
     @staticmethod
     def forward(ctx, z0, t, flat_parameters, func):
+        """
+        The forward pass computes the ODE solution from the initial state z0 over
+        the specified time points t, using the dynamics defined by func.
+
+        Args:
+            ctx: Context object that can be used to stash information for backward computation.
+            z0: The initial state of the ODE (e.g., initial values of the variables).
+            t: A tensor of time points at which the ODE solution is evaluated.
+            flat_parameters: Flattened parameters of the ODE function, used for parameter sensitivity analysis.
+            func: The function that defines the dynamics of the ODE, dz/dt = f(z, t).
+
+        Returns:
+            The solution of the ODE at each time point specified in t.
+        """
+
+        # Ensure func is an instance of ODEF, a user-defined class for ODE functions.
         assert isinstance(func, ODEF)
+
+        # Extract batch size and shape of the ODE state from the initial state.
         bs, *z_shape = z0.size()
+
+        # Number of time points.
         time_len = t.size(0)
 
+        # Use torch.no_grad() to prevent tracking of gradients since this is
+        # purely for the forward computation of the ODE solution.
         with torch.no_grad():
+            # Preallocate a tensor to hold the ODE solution at each time point.
             z = torch.zeros(time_len, bs, *z_shape).to(z0)
+            # The first solution is the initial condition.
             z[0] = z0
+
+            # Iterate over each time interval and solve the ODE using the specified solver.
             for i_t in range(time_len - 1):
+                # Solve the ODE from t[i_t] to t[i_t+1] using the dynamics defined by func.
+                # The solver updates z0 to the next time point.
                 z0 = ode_solve(z0, t[i_t], t[i_t+1], func)
+                # Store the solution.
                 z[i_t+1] = z0
 
+        # Save function and tensors for use in the backward pass.
+        # Note: It's crucial to clone z to avoid modifying it during the backward pass.
         ctx.func = func
         ctx.save_for_backward(t, z.clone(), flat_parameters)
+
+        # Return the ODE solution at the specified time points.
         return z
+
 
     @staticmethod
     def backward(ctx, dLdz):
         """
-        dLdz shape: time_len, batch_size, *z_shape
-        """
-        func = ctx.func
-        t, z, flat_parameters = ctx.saved_tensors
-        time_len, bs, *z_shape = z.size()
-        n_dim = np.prod(z_shape)
-        n_params = flat_parameters.size(0)
+        Performs the backward pass to compute gradients of the loss with respect to
+        the initial conditions, parameters, and time points of the ODE.
 
-        # Dynamics of augmented system to be calculated backwards in time
+        Args:
+            ctx: The context object where necessary information has been saved during the forward pass.
+            dLdz: The gradient of the loss with respect to the output of the ODE solver.
+
+        Returns:
+            Gradients with respect to the initial conditions, time points, parameters, and
+            the function defining the ODE dynamics (None for the last because it's typically
+            not a directly optimized quantity).
+        """
+
+        # Retrieve saved tensors and objects from the forward pass.
+        func = ctx.func  # The ODE function. Has arguments x and t.
+        t, z, flat_parameters = ctx.saved_tensors  # Time points, solution, and parameters.
+        time_len, bs, *z_shape = z.size()  # Unpack dimensions.
+        n_dim = np.prod(z_shape)  # Total dimensionality of the state.
+        n_params = flat_parameters.size(0)  # Number of parameters.
+
+
         def augmented_dynamics(aug_z_i, t_i):
             """
-            tensors here are temporal slices
-            t_i - is tensor with size: bs, 1
-            aug_z_i - is tensor with size: bs, n_dim*2 + n_params + 1
-            """
-            z_i, a = aug_z_i[:, :n_dim], aug_z_i[:, n_dim:2*n_dim]  # ignore parameters and time
+            Defines the dynamics of the augmented system to be solved backwards in time for
+            the adjoint method. The augmented system includes the original ODE system
+            along with additional equations for the adjoints (gradients) of the state
+            variables and parameters.
 
-            # Unflatten z and a
+            Args:
+                aug_z_i: A tensor containing the current values of the augmented system,
+                        which includes the state of the original ODE system, the adjoint
+                        (gradient) of the state, the adjoint of the parameters, and
+                        the adjoint of time, for each batch element.
+                t_i: The current time tensor for each batch element.
+
+            Returns:
+                A tensor that represents the time derivative of the augmented system
+                at the current time and state.
+            """
+
+            # Split the augmented state into the original state (z_i) and its adjoint (a),
+            # ignoring the adjoints of the parameters and time for now.
+            z_i, a = aug_z_i[:, :n_dim], aug_z_i[:, n_dim:2*n_dim]  # n_dim is the dimensionality of the original state.
+
+            # Unflatten z_i and a to their original shapes.
             z_i = z_i.view(bs, *z_shape)
             a = a.view(bs, *z_shape)
+
+            # Enable gradient tracking for z_i and t_i, required for computing gradients.
             with torch.set_grad_enabled(True):
+                # Detach and require gradients for the inputs to the original ODE function.
+                # This is necessary because we're computing gradients with respect to these variables.
                 t_i = t_i.detach().requires_grad_(True)
                 z_i = z_i.detach().requires_grad_(True)
-                func_eval, adfdz, adfdt, adfdp = func.forward_with_grad(z_i, t_i, grad_outputs=a)  # bs, *z_shape
+
+                # Evaluate the original ODE function with gradients, also obtaining gradients
+                # of the function output with respect to z_i, t_i, and the parameters.
+                func_eval, adfdz, adfdt, adfdp = func.forward_with_grad(z_i, t_i, grad_outputs=a)
+
+                # Ensure the gradients are in the same device and dtype as z_i;
+                # fill with zeros if None (i.e., if not provided by func).
                 adfdz = adfdz.to(z_i) if adfdz is not None else torch.zeros(bs, *z_shape).to(z_i)
                 adfdp = adfdp.to(z_i) if adfdp is not None else torch.zeros(bs, n_params).to(z_i)
                 adfdt = adfdt.to(z_i) if adfdt is not None else torch.zeros(bs, 1).to(z_i)
 
-            # Flatten f and adfdz
+            # Flatten func_eval and adfdz for concatenation.
             func_eval = func_eval.view(bs, n_dim)
-            adfdz = adfdz.reshape(bs, n_dim) 
+            adfdz = adfdz.reshape(bs, n_dim)
+
+            # Concatenate the time derivative of the original state, the negative adjoint of the state,
+            # the negative adjoint of the parameters, and the negative adjoint of time, to form
+            # the time derivative of the augmented system.
             return torch.cat((func_eval, -adfdz, -adfdp, -adfdt), dim=1)
 
-        dLdz = dLdz.view(time_len, bs, n_dim)  # flatten dLdz for convenience
-        with torch.no_grad():
-            ## Create placeholders for output gradients
-            # Prev computed backwards adjoints to be adjusted by direct gradients
-            adj_z = torch.zeros(bs, n_dim).to(dLdz)
-            adj_p = torch.zeros(bs, n_params).to(dLdz)
-            # In contrast to z and p we need to return gradients for all times
-            adj_t = torch.zeros(time_len, bs, 1).to(dLdz)
+        # Prepare for adjoint computation.
+        dLdz = dLdz.view(time_len, bs, n_dim)  # Flatten the gradient for convenience.
 
-            for i_t in range(time_len-1, 0, -1):
-                z_i = z[i_t]
-                t_i = t[i_t]
-                f_i = func(z_i, t_i).view(bs, n_dim)
+        # Initialize gradients with respect to state, parameters, and time as zeros.
+        adj_z = torch.zeros(bs, n_dim).to(dLdz)  # Gradient w.r.t. state.
+        adj_p = torch.zeros(bs, n_params).to(dLdz)  # Gradient w.r.t. parameters.
+        adj_t = torch.zeros(time_len, bs, 1).to(dLdz)  # Gradient w.r.t. time.
 
-                # Compute direct gradients
-                dLdz_i = dLdz[i_t]
-                dLdt_i = torch.bmm(torch.transpose(dLdz_i.unsqueeze(-1), 1, 2), f_i.unsqueeze(-1))[:, 0]
+        # Iterate backward through time points to compute adjoints.
+        for i_t in range(time_len-1, 0, -1):
+            z_i = z[i_t]  # State at current time.
+            t_i = t[i_t]  # Current time.
+            f_i = func(z_i, t_i).view(bs, n_dim)  # Evaluate ODE function at current state and time.
 
-                # Adjusting adjoints with direct gradients
-                adj_z += dLdz_i
-                adj_t[i_t] = adj_t[i_t] - dLdt_i
+            # Direct gradients computation.
+            dLdz_i = dLdz[i_t]  # Gradient of loss w.r.t. current state.
+            # Gradient of loss w.r.t. current time by chain rule.
+            dLdt_i = torch.bmm(torch.transpose(dLdz_i.unsqueeze(-1), 1, 2), f_i.unsqueeze(-1))[:, 0]
 
-                # Pack augmented variable
-                aug_z = torch.cat((z_i.view(bs, n_dim), adj_z, torch.zeros(bs, n_params).to(z), adj_t[i_t]), dim=-1)
+            # Adjust adjoints with direct gradients.
+            adj_z += dLdz_i  # Adjust state adjoint.
+            adj_t[i_t] = adj_t[i_t] - dLdt_i  # Adjust time adjoint.
 
-                # Solve augmented system backwards
-                aug_ans = ode_solve(aug_z, t_i, t[i_t-1], augmented_dynamics)
+            # Pack current augmented state for solving backward.
+            aug_z = torch.cat((z_i.view(bs, n_dim), adj_z, torch.zeros(bs, n_params).to(z), adj_t[i_t]), dim=-1)
 
-                # Unpack solved backwards augmented system
-                adj_z[:] = aug_ans[:, n_dim:2*n_dim]
-                adj_p[:] += aug_ans[:, 2*n_dim:2*n_dim + n_params]
-                adj_t[i_t-1] = aug_ans[:, 2*n_dim + n_params:]
+            # Solve the augmented system backwards to adjust adjoints.
+            aug_ans = ode_solve(aug_z, t_i, t[i_t-1], augmented_dynamics)
 
-                del aug_z, aug_ans
+            # Unpack the adjusted adjoints.
+            adj_z[:] = aug_ans[:, n_dim:2*n_dim]
+            adj_p[:] += aug_ans[:, 2*n_dim:2*n_dim + n_params]
+            adj_t[i_t-1] = aug_ans[:, 2*n_dim + n_params:]
 
-            ## Adjust 0 time adjoint with direct gradients
-            # Compute direct gradients 
-            dLdz_0 = dLdz[0]
-            dLdt_0 = torch.bmm(torch.transpose(dLdz_0.unsqueeze(-1), 1, 2), f_i.unsqueeze(-1))[:, 0]
+        # Adjust the initial time adjoint with direct gradients.
+        dLdz_0 = dLdz[0]  # Gradient of loss w.r.t. initial state.
+        dLdt_0 = torch.bmm(torch.transpose(dLdz_0.unsqueeze(-1), 1, 2), f_i.unsqueeze(-1))[:, 0]
+        adj_z += dLdz_0  # Adjust initial state adjoint.
+        adj_t[0] = adj_t[0] - dLdt_0  # Adjust initial time adjoint.
 
-            # Adjust adjoints
-            adj_z += dLdz_0
-            adj_t[0] = adj_t[0] - dLdt_0
+        # Return gradients w.r.t. initial conditions, time, and parameters (None for func as it's not optimized directly).
         return adj_z.view(bs, *z_shape), adj_t, adj_p, None
 
 class NeuralODE(nn.Module):
@@ -212,7 +340,8 @@ class CausalSelfAttentionAfterLN(nn.Module):
         self.ln_weight = nn.Parameter(torch.ones(config.n_embd + 1))
         self.ln_bias = nn.Parameter(torch.zeros(config.n_embd + 1)) if config.bias else None
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        # self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.flash = False
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
@@ -222,7 +351,7 @@ class CausalSelfAttentionAfterLN(nn.Module):
     def forward(self, x):
         x = F.layer_norm(x, self.ln_weight.shape, self.ln_weight, self.ln_bias, 1e-5)
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        C -= 1 # no comment
+        C -= 1 # adjust because time variable was added here
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
@@ -238,9 +367,20 @@ class CausalSelfAttentionAfterLN(nn.Module):
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att_shape = att.shape
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            att = att.view(-1, att_shape[2], att_shape[3])
+
+
+            sink = SinkhornDistance(1, max_iter=MAX_ITER_SINK)
+            # print(f"att.shape={att.shape}")
+            sinked_att = sink(att)[0]
+            sinked_att = sinked_att * sinked_att.shape[-1]
+            # print(f"sinked_att.shape={sinked_att.shape}")
+            # print(f"v.shape={v.shape}")
+            sinked_att = sinked_att.view(att_shape)
+            y = sinked_att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
@@ -273,6 +413,34 @@ def add_time(in_tensor, t):
     return torch.cat((in_tensor, t.expand(batch, time, 1)), dim=-1)
 
 
+class SATNetLayer(nn.Module):
+    def __init__(self, config):
+        super(SATNetLayer, self).__init__()
+        n = config.block_size * config.n_embd
+        m = 600
+        aux = 300
+        self.satnet = satnet.SATNet(n, m, aux)
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        x = x.view(B, -1)
+        is_input = torch.ones_like(x).int()
+        o = self.satnet(x, is_input)
+        o = o.view(B, T, C)
+        return o
+
+class ResSAT(nn.Module):
+    def __init__(self, block, config):
+        super(ResSAT, self).__init__()
+        self.block = block
+        self.sat = SATNetLayer(config)
+
+    def forward(self, x):
+        h1 = self.block(x)
+        h2 = self.sat(h1)
+        return h1 + h2
+
+
 class Block(ODEF):
     def __init__(self, config):
         super(Block, self).__init__()
@@ -283,8 +451,8 @@ class Block(ODEF):
         xt = add_time(x, t)
         h = self.attn_after_ln(xt)
         ht = add_time(h, t)
-        dxdt = self.mlp_after_ln(ht)
-        return dxdt
+        o = self.mlp_after_ln(ht)
+        return o
 
 @dataclass
 class GPTConfig:
@@ -308,7 +476,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([NeuralODE(Block(config)) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([ResSAT(NeuralODE(Block(config)), config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)

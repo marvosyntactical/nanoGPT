@@ -31,6 +31,7 @@ import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 
 from node_model import GPTConfig, GPT
+# from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
