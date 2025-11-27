@@ -30,8 +30,11 @@ from torch.distributed import init_process_group, destroy_process_group
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 
-from node_model import GPTConfig, GPT
-# from model import GPTConfig, GPT
+# from node_model import GPTConfig, GPT
+from model import GPTConfig, GPT
+from jko_layer import JKOGPTConfig, JKOGPT
+
+
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -48,14 +51,14 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
+dataset = 'shakespeare'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+block_size = 512
 # model
 n_layer = 12
 n_head = 12
-n_embd = 768
+n_embd = 256+128
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
@@ -73,9 +76,19 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+
+
+# jko 
+use_jko = True  # Set to False for standard transformer comparison
+tau_init = 1.0
+nu_init = 0.1
+n_inner_iters = 3
+inner_lr = 0.5
+use_sinkhorn = False
+
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -150,15 +163,30 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+# if init_from == 'scratch':
+#     # init a new model from scratch
+#     print("Initializing a new model from scratch")
+#     # determine the vocab size we'll use for from-scratch training
+#     if meta_vocab_size is None:
+#         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+#     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+#     gptconf = GPTConfig(**model_args)
+#     model = GPT(gptconf)
 if init_from == 'scratch':
-    # init a new model from scratch
     print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+
+    # Create JKO or standard GPT
+    jko_config = JKOGPTConfig(
+        **model_args,
+        use_jko=use_jko,
+        tau_init=tau_init,
+        nu_init=nu_init,
+        n_inner_iters=n_inner_iters,
+        inner_lr=inner_lr,
+        use_sinkhorn=use_sinkhorn,
+    )
+    model = JKOGPT(jko_config)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -328,6 +356,40 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+
+        # Get JKO metrics
+        if hasattr(raw_model, 'get_layer_metrics'):
+            jko_metrics = raw_model.get_layer_metrics()
+
+            if wandb_log:
+                # Log layer-wise metrics
+                for i, (ent, fe) in enumerate(zip(
+                    jko_metrics.get('layer_entropy', []),
+                    jko_metrics.get('layer_free_energy', [])
+                )):
+                    wandb.log({
+                        f"layer_{i}/entropy": ent,
+                        f"layer_{i}/free_energy": fe,
+                    }, step=iter_num)
+
+                # Log aggregates
+                wandb.log({
+                    "thermo/mean_entropy": jko_metrics.get('mean_entropy', 0),
+                    "thermo/mean_free_energy": jko_metrics.get('mean_free_energy', 0),
+                    "thermo/free_energy_decrease": jko_metrics.get('free_energy_decrease', 0),
+                    "thermo/free_energy_monotonic": jko_metrics.get('free_energy_monotonic', 0),
+                }, step=iter_num)
+
+                # Log learned tau/nu
+                for i, (tau, nu) in enumerate(zip(
+                    jko_metrics.get('layer_tau', []),
+                    jko_metrics.get('layer_nu', [])
+                )):
+                    wandb.log({
+                        f"layer_{i}/tau": tau,
+                        f"layer_{i}/nu": nu,
+                    }, step=iter_num)
+
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1

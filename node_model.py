@@ -20,13 +20,12 @@ from torch.nn import functional as F
 from torch.autograd import Variable
 
 from sinkhorn import SinkhornDistance
-import satnet
 
 MAX_ITER_SINK = 6
 
 # the following are taken from https://github.com/msurtsukov/neural-ode/blob/master/Neural%20ODEs.ipynb
 
-def ode_solve_euler(z0, t0, t1, f, h_max=0.05):
+def ode_solve_euler(z0, t0, t1, f, h_max=0.1):
     """
     Simplest Euler ODE initial value solver
     """
@@ -366,12 +365,14 @@ class CausalSelfAttentionAfterLN(nn.Module):
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+
+            # TODO NOTE FIXME: move mask inside sinkhorn loop
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+
             att_shape = att.shape
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             att = att.view(-1, att_shape[2], att_shape[3])
-
 
             sink = SinkhornDistance(1, max_iter=MAX_ITER_SINK)
             # print(f"att.shape={att.shape}")
@@ -415,6 +416,7 @@ def add_time(in_tensor, t):
 
 class SATNetLayer(nn.Module):
     def __init__(self, config):
+        import satnet
         super(SATNetLayer, self).__init__()
         n = config.block_size * config.n_embd
         m = 600
@@ -476,7 +478,8 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([ResSAT(NeuralODE(Block(config)), config) for _ in range(config.n_layer)]),
+            # h = nn.ModuleList([ResSAT(NeuralODE(Block(config)), config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([NeuralODE(Block(config)) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -677,3 +680,47 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+
+# I implemented the Transformer as a NODE here
+# Im revisiting this file atm, remind me how node works
+# IIRC this was really slow compared to the default implementation of the transformer, will benchmark in a sec
+# What are advantages and disadvantages of the NODE treatment?
+# I want the discretization fidelity to be chosen on the fly, i.e. make the ode approxn be as precise as needed for a given token, how would I do this?
+
+# Advantages of NODE treatment:
+# - Continuous time representation allows for more flexible modeling
+# - Can potentially capture long-range dependencies better
+# - Theoretically more parameter efficient
+
+# Disadvantages:
+# - Computationally expensive, especially for long sequences
+# - May be overkill for tasks where discrete time steps are sufficient
+# - Can be harder to interpret/debug
+
+# To choose discretization fidelity on the fly:
+# 1. Implement adaptive step size control in the ODE solver
+# 2. Use error estimates to adjust step size dynamically
+# 3. Set a tolerance level and adjust fidelity to meet it
+
+# Example implementation:
+class AdaptiveNeuralODE(nn.Module):
+    def __init__(self, func, rtol=1e-3, atol=1e-3):
+        super().__init__()
+        self.func = func
+        self.rtol = rtol
+        self.atol = atol
+        
+    def forward(self, z0, t):
+        solution = ode.odeint_adjoint(
+            self.func, 
+            z0, 
+            t, 
+            rtol=self.rtol, 
+            atol=self.atol,
+            method='dopri5'  # Adaptive Runge-Kutta method
+        )
+        return solution
+
+# Replace NeuralODE with AdaptiveNeuralODE in the model
+# Adjust rtol and atol as needed for precision vs. speed tradeoff
