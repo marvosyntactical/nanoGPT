@@ -140,13 +140,17 @@ class ScalarPotentialMLP(nn.Module):
         """Returns potential U and its gradient ∇U w.r.t. x."""
         x = x.requires_grad_(True)
         U = self.forward(x)
+        Us = U.sum()
+
+        # for t in [Us, x]:
+        #     print(t.requires_grad)
 
         # Compute gradient
         grad_U = torch.autograd.grad(
-                U.sum(), x, 
-                create_graph=self.training,
-                retain_graph=True
-                )[0]
+            Us, x,
+            create_graph=self.training,
+            retain_graph=True
+        )[0]
 
         return U, grad_U
 
